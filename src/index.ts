@@ -1,10 +1,13 @@
 export * from './use-swr'
-export { default } from './use-swr'
-export { useSWRPages } from './use-swr-pages'
+import { default as useSWR } from './use-swr'
+export { useSWRInfinite } from './use-swr-infinite'
+export { cache } from './config'
 export {
   ConfigInterface,
   revalidateType,
   RevalidateOptionInterface,
   keyInterface,
-  responseInterface
+  responseInterface,
+  CacheInterface
 } from './types'
+export default useSWR

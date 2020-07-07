@@ -1,60 +1,150 @@
 import {
-  useState,
-  useLayoutEffect,
-  useRef,
+  useCallback,
   useContext,
-  useCallback
+  useEffect,
+  useLayoutEffect,
+  useState,
+  useRef,
+  useMemo
 } from 'react'
-import { unstable_batchedUpdates } from 'react-dom'
-import throttle from 'lodash.throttle'
-import deepEqual from 'deep-equal'
-
-import {
-  keyInterface,
-  ConfigInterface,
-  RevalidateOptionInterface,
-  updaterInterface,
-  triggerInterface,
-  mutateInterface,
-  responseInterface
-} from './types'
 
 import defaultConfig, {
+  CACHE_REVALIDATORS,
   CONCURRENT_PROMISES,
   CONCURRENT_PROMISES_TS,
   FOCUS_REVALIDATORS,
-  CACHE_REVALIDATORS,
   MUTATION_TS,
-  cacheGet,
-  cacheSet
+  MUTATION_END_TS,
+  cache
 } from './config'
-import SWRConfigContext from './swr-config-context'
 import isDocumentVisible from './libs/is-document-visible'
-import useHydration from './libs/use-hydration'
+import isOnline from './libs/is-online'
+import throttle from './libs/throttle'
+import SWRConfigContext from './swr-config-context'
+import {
+  actionType,
+  broadcastStateInterface,
+  ConfigInterface,
+  fetcherFn,
+  keyInterface,
+  mutateInterface,
+  responseInterface,
+  RevalidateOptionInterface,
+  triggerInterface,
+  updaterInterface
+} from './types'
 
-const trigger: triggerInterface = function(key, shouldRevalidate = true) {
+const IS_SERVER = typeof window === 'undefined'
+
+// React currently throws a warning when using useLayoutEffect on the server.
+// To get around it, we can conditionally useEffect on the server (no-op) and
+// useLayoutEffect in the browser.
+const useIsomorphicLayoutEffect = IS_SERVER ? useEffect : useLayoutEffect
+
+const trigger: triggerInterface = (_key, shouldRevalidate = true) => {
+  // we are ignoring the second argument which correspond to the arguments
+  // the fetcher will receive when key is an array
+  const [key, , keyErr] = cache.serializeKey(_key)
+  if (!key) return Promise.resolve()
+
   const updaters = CACHE_REVALIDATORS[key]
-  if (updaters) {
+
+  if (key && updaters) {
+    const currentData = cache.get(key)
+    const currentError = cache.get(keyErr)
+    const promises = []
     for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](shouldRevalidate)
+      promises.push(
+        updaters[i](shouldRevalidate, currentData, currentError, i > 0)
+      )
+    }
+    // return new updated value
+    return Promise.all(promises).then(() => cache.get(key))
+  }
+  return Promise.resolve(cache.get(key))
+}
+
+const broadcastState: broadcastStateInterface = (key, data, error) => {
+  const updaters = CACHE_REVALIDATORS[key]
+  if (key && updaters) {
+    for (let i = 0; i < updaters.length; ++i) {
+      updaters[i](false, data, error)
     }
   }
 }
 
-const mutate: mutateInterface = function(key, data, shouldRevalidate = true) {
-  // update timestamp
+const mutate: mutateInterface = async (
+  _key,
+  _data,
+  shouldRevalidate = true
+) => {
+  const [key, , keyErr] = cache.serializeKey(_key)
+  if (!key) return
+
+  // if there is no new data, call revalidate against the key
+  if (typeof _data === 'undefined') return trigger(_key, shouldRevalidate)
+
+  // update timestamps
   MUTATION_TS[key] = Date.now() - 1
+  MUTATION_END_TS[key] = 0
 
-  // update cached data
-  cacheSet(key, data)
+  // keep track of timestamps before await asynchronously
+  const beforeMutationTs = MUTATION_TS[key]
+  const beforeConcurrentPromisesTs = CONCURRENT_PROMISES_TS[key]
 
+  let data, error
+
+  if (_data && typeof _data === 'function') {
+    // `_data` is a function, call it passing current cache value
+    try {
+      data = await _data(cache.get(key))
+    } catch (err) {
+      error = err
+    }
+  } else if (_data && typeof _data.then === 'function') {
+    // `_data` is a promise
+    try {
+      data = await _data
+    } catch (err) {
+      error = err
+    }
+  } else {
+    data = _data
+  }
+
+  // check if other mutations have occurred since we've started awaiting, if so then do not persist this change
+  if (
+    beforeMutationTs !== MUTATION_TS[key] ||
+    beforeConcurrentPromisesTs !== CONCURRENT_PROMISES_TS[key]
+  ) {
+    if (error) throw error
+    return data
+  }
+
+  if (typeof data !== 'undefined') {
+    // update cached data, avoid notifying from the cache
+    cache.set(key, data)
+  }
+  cache.set(keyErr, error)
+
+  // reset the timestamp to mark the mutation has ended
+  MUTATION_END_TS[key] = Date.now() - 1
+
+  // enter the revalidation stage
   // update existing SWR Hooks' state
   const updaters = CACHE_REVALIDATORS[key]
   if (updaters) {
+    const promises = []
     for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](shouldRevalidate)
+      promises.push(updaters[i](!!shouldRevalidate, data, error, i > 0))
     }
+    // return new updated value
+    return Promise.all(promises).then(() => cache.get(key))
   }
+
+  // throw error or return data to be used by caller of mutate
+  if (error) throw error
+  return data
 }
 
 function useSWR<Data = any, Error = any>(
@@ -66,42 +156,34 @@ function useSWR<Data = any, Error = any>(
 ): responseInterface<Data, Error>
 function useSWR<Data = any, Error = any>(
   key: keyInterface,
-  fn?: Function,
+  fn?: fetcherFn<Data>,
   config?: ConfigInterface<Data, Error>
 ): responseInterface<Data, Error>
 function useSWR<Data = any, Error = any>(
   ...args
 ): responseInterface<Data, Error> {
   let _key: keyInterface,
-    fn: Function | undefined,
+    fn: fetcherFn<Data> | undefined,
     config: ConfigInterface<Data, Error> = {}
   if (args.length >= 1) {
     _key = args[0]
   }
-  if (typeof args[1] === 'function') {
+  if (args.length > 2) {
     fn = args[1]
-  } else if (typeof args[1] === 'object') {
-    config = args[1]
-  }
-  if (typeof args[2] === 'object') {
     config = args[2]
+  } else {
+    if (typeof args[1] === 'function') {
+      fn = args[1]
+    } else if (typeof args[1] === 'object') {
+      config = args[1]
+    }
   }
 
   // we assume `key` as the identifier of the request
   // `key` can change but `fn` shouldn't
   // (because `revalidate` only depends on `key`)
-
-  let key: string
-  if (typeof _key === 'function') {
-    try {
-      key = _key()
-    } catch (err) {
-      // dependencies not ready
-      key = ''
-    }
-  } else {
-    key = _key
-  }
+  // `keyErr` is the cache key for error objects
+  const [key, fnArgs, keyErr] = cache.serializeKey(_key)
 
   config = Object.assign(
     {},
@@ -111,110 +193,206 @@ function useSWR<Data = any, Error = any>(
   )
 
   if (typeof fn === 'undefined') {
-    // use a global fetcher
+    // use the global fetcher
     fn = config.fetcher
   }
 
-  // stale: get from cache
-  let [data, setData] = useState(useHydration() ? undefined : cacheGet(key))
-  let [error, setError] = useState()
-  let [isValidating, setIsValidating] = useState(false)
+  const initialData = cache.get(key) || config.initialData
+  const initialError = cache.get(keyErr)
+
+  // if a state is accessed (data, error or isValidating),
+  // we add the state to dependencies so if the state is
+  // updated in the future, we can trigger a rerender
+  const stateDependencies = useRef({
+    data: false,
+    error: false,
+    isValidating: false
+  })
+  const stateRef = useRef({
+    data: initialData,
+    error: initialError,
+    isValidating: false
+  })
+
+  const rerender = useState(null)[1]
+  let dispatch = useCallback(payload => {
+    let shouldUpdateState = false
+    for (let k in payload) {
+      stateRef.current[k] = payload[k]
+      if (stateDependencies.current[k]) {
+        shouldUpdateState = true
+      }
+    }
+    if (shouldUpdateState || config.suspense) {
+      rerender({})
+    }
+  }, [])
 
   // error ref inside revalidate (is last request errored?)
-  const errorRef = useRef(false)
   const unmountedRef = useRef(false)
   const keyRef = useRef(key)
-  const dataRef = useRef(data)
 
+  // do unmount check for callbacks
+  const eventsRef = useRef({
+    emit: (event, ...params) => {
+      if (unmountedRef.current) return
+      config[event](...params)
+    }
+  })
+
+  const boundMutate: responseInterface<Data, Error>['mutate'] = useCallback(
+    (data, shouldRevalidate) => {
+      return mutate(key, data, shouldRevalidate)
+    },
+    [key]
+  )
+
+  // start a revalidation
   const revalidate = useCallback(
     async (
       revalidateOpts: RevalidateOptionInterface = {}
     ): Promise<boolean> => {
-      if (!key) return false
+      if (!key || !fn) return false
       if (unmountedRef.current) return false
+      revalidateOpts = Object.assign({ dedupe: false }, revalidateOpts)
 
       let loading = true
+      let shouldDeduping =
+        typeof CONCURRENT_PROMISES[key] !== 'undefined' && revalidateOpts.dedupe
 
+      // start fetching
       try {
-        setIsValidating(true)
+        dispatch({
+          isValidating: true
+        })
 
         let newData
-        let originalRequest = !!(
-          CONCURRENT_PROMISES[key] === undefined || revalidateOpts.noDedupe
-        )
-        let ts
+        let startAt
 
-        if (!originalRequest) {
-          // different component, dedupe requests
-          // need the new data for the state
-          ts = CONCURRENT_PROMISES_TS[key]
+        if (shouldDeduping) {
+          // there's already an ongoing request,
+          // this one needs to be deduplicated.
+          startAt = CONCURRENT_PROMISES_TS[key]
           newData = await CONCURRENT_PROMISES[key]
         } else {
-          // if no cache being rendered (blank page),
-          // we trigger the loading slow event
-          if (!cacheGet(key)) {
+          // if no cache being rendered currently (it shows a blank page),
+          // we trigger the loading slow event.
+          if (config.loadingTimeout && !cache.get(key)) {
             setTimeout(() => {
-              if (loading) config.onLoadingSlow(key, config)
+              if (loading) eventsRef.current.emit('onLoadingSlow', key, config)
             }, config.loadingTimeout)
           }
-          CONCURRENT_PROMISES[key] = fn(key)
-          CONCURRENT_PROMISES_TS[key] = ts = Date.now()
+
+          if (fnArgs !== null) {
+            CONCURRENT_PROMISES[key] = fn(...fnArgs)
+          } else {
+            CONCURRENT_PROMISES[key] = fn(key)
+          }
+
+          CONCURRENT_PROMISES_TS[key] = startAt = Date.now()
+
+          newData = await CONCURRENT_PROMISES[key]
+
           setTimeout(() => {
             delete CONCURRENT_PROMISES[key]
             delete CONCURRENT_PROMISES_TS[key]
           }, config.dedupingInterval)
-          newData = await CONCURRENT_PROMISES[key]
 
-          // trigger the success event
-          // (only do it for the original request)
-          config.onSuccess(newData, key, config)
+          // trigger the success event,
+          // only do this for the original request.
+          eventsRef.current.emit('onSuccess', newData, key, config)
         }
 
-        // if the revalidation happened earlier than local mutations,
-        // we should ignore the result because it could override.
-        if (MUTATION_TS[key] && ts <= MUTATION_TS[key]) {
-          setIsValidating(false)
+        const shouldIgnoreRequest =
+          // if there're other ongoing request(s), started after the current one,
+          // we need to ignore the current one to avoid possible race conditions:
+          //   req1------------------>res1        (current one)
+          //        req2---------------->res2
+          // the request that fired later will always be kept.
+          CONCURRENT_PROMISES_TS[key] > startAt ||
+          // if there're other mutations(s), overlapped with the current revalidation:
+          // case 1:
+          //   req------------------>res
+          //       mutate------>end
+          // case 2:
+          //         req------------>res
+          //   mutate------>end
+          // case 3:
+          //   req------------------>res
+          //       mutate-------...---------->
+          // we have to ignore the revalidation result (res) because it's no longer fresh.
+          // meanwhile, a new revalidation should be triggered when the mutation ends.
+          (MUTATION_TS[key] &&
+            // case 1
+            (startAt <= MUTATION_TS[key] ||
+              // case 2
+              startAt <= MUTATION_END_TS[key] ||
+              // case 3
+              MUTATION_END_TS[key] === 0))
+
+        if (shouldIgnoreRequest) {
+          dispatch({ isValidating: false })
           return false
         }
 
-        errorRef.current = false
+        cache.set(key, newData)
+        cache.set(keyErr, undefined)
 
-        unstable_batchedUpdates(() => {
-          setIsValidating(false)
-          setError(undefined)
-          if (dataRef.current && deepEqual(dataRef.current, newData)) {
-            // deep compare to avoid extra re-render
-            // do nothing
-          } else {
-            // data changed
-            setData(newData)
-            cacheSet(key, newData)
-            if (originalRequest) {
-              // also update other SWRs from cache
-              trigger(key, false)
-            }
-            keyRef.current = key
-            dataRef.current = newData
-          }
-        })
+        // new state for the reducer
+        const newState: actionType<Data, Error> = {
+          isValidating: false
+        }
+
+        if (typeof stateRef.current.error !== 'undefined') {
+          // we don't have an error
+          newState.error = undefined
+        }
+        if (!config.compare(stateRef.current.data, newData)) {
+          // deep compare to avoid extra re-render
+          // data changed
+          newState.data = newData
+        }
+
+        // merge the new state
+        dispatch(newState)
+
+        if (!shouldDeduping) {
+          // also update other hooks
+          broadcastState(key, newData, undefined)
+        }
       } catch (err) {
         delete CONCURRENT_PROMISES[key]
-        unstable_batchedUpdates(() => {
-          setIsValidating(false)
-          setError(err)
-        })
+        delete CONCURRENT_PROMISES_TS[key]
 
-        config.onError(err, key, config)
-        errorRef.current = true
+        cache.set(keyErr, err)
 
+        // get a new error
+        // don't use deep equal for errors
+        if (stateRef.current.error !== err) {
+          // we keep the stale data
+          dispatch({
+            isValidating: false,
+            error: err
+          })
+
+          if (!shouldDeduping) {
+            // also broadcast to update other hooks
+            broadcastState(key, undefined, err)
+          }
+        }
+
+        // events and retry
+        eventsRef.current.emit('onError', err, key, config)
         if (config.shouldRetryOnError) {
+          // when retrying, we always enable deduping
           const retryCount = (revalidateOpts.retryCount || 0) + 1
-          config.onErrorRetry(
+          eventsRef.current.emit(
+            'onErrorRetry',
             err,
             key,
             config,
             revalidate,
-            Object.assign({}, revalidateOpts, { retryCount })
+            Object.assign({ dedupe: true }, revalidateOpts, { retryCount })
           )
         }
       }
@@ -224,41 +402,57 @@ function useSWR<Data = any, Error = any>(
     },
     [key]
   )
-  const forceRevalidate = useCallback(() => revalidate({ noDedupe: true }), [
-    revalidate
-  ])
 
-  // mounted
-  useLayoutEffect(() => {
+  // mounted (client side rendering)
+  useIsomorphicLayoutEffect(() => {
     if (!key) return undefined
 
     // after `key` updates, we need to mark it as mounted
     unmountedRef.current = false
 
-    const _newData = cacheGet(key)
+    // after the component is mounted (hydrated),
+    // we need to update the data from the cache
+    // and trigger a revalidation
 
-    // update the state if the cache changed OR the key changed
-    if ((_newData && !deepEqual(data, _newData)) || keyRef.current !== key) {
-      setData(_newData)
-      dataRef.current = _newData
+    const currentHookData = stateRef.current.data
+    const latestKeyedData = cache.get(key) || config.initialData
+
+    // update the state if the key changed (not the inital render) or cache updated
+    if (
+      keyRef.current !== key ||
+      !config.compare(currentHookData, latestKeyedData)
+    ) {
+      dispatch({ data: latestKeyedData })
       keyRef.current = key
     }
 
-    // revalidate after mounted
-    if (_newData && window['requestIdleCallback']) {
-      // delay revalidate if there's cache
-      // to not block the rendering
-      window['requestIdleCallback'](revalidate)
-    } else {
-      revalidate()
+    // revalidate with deduping
+    const softRevalidate = () => revalidate({ dedupe: true })
+
+    // trigger a revalidation
+    if (
+      config.revalidateOnMount ||
+      (!config.initialData && config.revalidateOnMount === undefined)
+    ) {
+      if (
+        typeof latestKeyedData !== 'undefined' &&
+        !IS_SERVER &&
+        window['requestIdleCallback']
+      ) {
+        // delay revalidate if there's cache
+        // to not block the rendering
+        window['requestIdleCallback'](softRevalidate)
+      } else {
+        softRevalidate()
+      }
     }
 
     // whenever the window gets focused, revalidate
-    // throttle: avoid being called twice from both listeners
-    // and tabs being switched quickly
-    const onFocus = throttle(revalidate, config.focusThrottleInterval)
-
+    let onFocus
     if (config.revalidateOnFocus) {
+      // throttle: avoid being called twice from both listeners
+      // and tabs being switched quickly
+      onFocus = throttle(softRevalidate, config.focusThrottleInterval)
       if (!FOCUS_REVALIDATORS[key]) {
         FOCUS_REVALIDATORS[key] = [onFocus]
       } else {
@@ -266,95 +460,206 @@ function useSWR<Data = any, Error = any>(
       }
     }
 
-    // updater
-    const onUpdate: updaterInterface = (shouldRevalidate = true) => {
-      // update data from the cache
-      const newData = cacheGet(key)
-      if (!deepEqual(data, newData)) {
-        unstable_batchedUpdates(() => {
-          setError(undefined)
-          setData(newData)
-        })
-        dataRef.current = newData
-        keyRef.current = key
+    // register global cache update listener
+    const onUpdate: updaterInterface<Data, Error> = (
+      shouldRevalidate = true,
+      updatedData,
+      updatedError,
+      dedupe = true
+    ) => {
+      // update hook state
+      const newState: actionType<Data, Error> = {}
+      let needUpdate = false
+
+      if (
+        typeof updatedData !== 'undefined' &&
+        !config.compare(stateRef.current.data, updatedData)
+      ) {
+        newState.data = updatedData
+        needUpdate = true
+      }
+
+      // always update error
+      // because it can be `undefined`
+      if (stateRef.current.error !== updatedError) {
+        newState.error = updatedError
+        needUpdate = true
+      }
+
+      if (needUpdate) {
+        dispatch(newState)
       }
 
       if (shouldRevalidate) {
-        return revalidate()
+        if (dedupe) {
+          return softRevalidate()
+        } else {
+          return revalidate()
+        }
       }
       return false
     }
+
+    // add updater to listeners
     if (!CACHE_REVALIDATORS[key]) {
       CACHE_REVALIDATORS[key] = [onUpdate]
     } else {
       CACHE_REVALIDATORS[key].push(onUpdate)
     }
 
-    // polling
-    let id = null
-    async function tick() {
-      if (
-        !errorRef.current &&
-        (config.refreshWhenHidden || isDocumentVisible())
-      ) {
-        // only revalidate when the page is visible
-        // if API request errored, we stop polling in this round
-        // and let the error retry function handle it
-        await revalidate()
-      }
-
-      const interval = config.refreshInterval
-      id = setTimeout(tick, interval)
-    }
-    if (config.refreshInterval) {
-      id = setTimeout(tick, config.refreshInterval)
+    // set up reconnecting when the browser regains network connection
+    let reconnect = null
+    if (!IS_SERVER && window.addEventListener && config.revalidateOnReconnect) {
+      window.addEventListener('online', (reconnect = softRevalidate))
     }
 
     return () => {
       // cleanup
-      setData = () => null
-      setIsValidating = () => null
-      setError = () => null
+      dispatch = () => null
 
       // mark it as unmounted
       unmountedRef.current = true
 
-      if (FOCUS_REVALIDATORS[key]) {
-        const index = FOCUS_REVALIDATORS[key].indexOf(onFocus)
-        if (index >= 0) FOCUS_REVALIDATORS[key].splice(index, 1)
+      if (onFocus && FOCUS_REVALIDATORS[key]) {
+        const revalidators = FOCUS_REVALIDATORS[key]
+        const index = revalidators.indexOf(onFocus)
+        if (index >= 0) {
+          // 10x faster than splice
+          // https://jsperf.com/array-remove-by-index
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
       }
       if (CACHE_REVALIDATORS[key]) {
-        const index = CACHE_REVALIDATORS[key].indexOf(onUpdate)
-        if (index >= 0) CACHE_REVALIDATORS[key].splice(index, 1)
+        const revalidators = CACHE_REVALIDATORS[key]
+        const index = revalidators.indexOf(onUpdate)
+        if (index >= 0) {
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
       }
 
-      if (id !== null) {
-        clearTimeout(id)
+      if (!IS_SERVER && window.removeEventListener && reconnect !== null) {
+        window.removeEventListener('online', reconnect)
       }
     }
-  }, [key, config.refreshInterval, revalidate])
+  }, [key, revalidate])
 
-  // suspense (client side only)
-  if (config.suspense && !data) {
-    if (typeof window !== 'undefined') {
+  // set up polling
+  useIsomorphicLayoutEffect(() => {
+    let timer = null
+    const tick = async () => {
+      if (
+        !stateRef.current.error &&
+        (config.refreshWhenHidden || isDocumentVisible()) &&
+        (config.refreshWhenOffline || isOnline())
+      ) {
+        // only revalidate when the page is visible
+        // if API request errored, we stop polling in this round
+        // and let the error retry function handle it
+        await revalidate({ dedupe: true })
+      }
+      if (config.refreshInterval) {
+        timer = setTimeout(tick, config.refreshInterval)
+      }
+    }
+    if (config.refreshInterval) {
+      timer = setTimeout(tick, config.refreshInterval)
+    }
+    return () => {
+      if (timer) clearTimeout(timer)
+    }
+  }, [
+    config.refreshInterval,
+    config.refreshWhenHidden,
+    config.refreshWhenOffline,
+    revalidate
+  ])
+
+  // suspense
+  if (config.suspense) {
+    // in suspense mode, we can't return empty state
+    // (it should be suspended)
+
+    // try to get data and error from cache
+    let latestData = cache.get(key) || initialData
+    let latestError = cache.get(keyErr) || initialError
+
+    if (
+      typeof latestData === 'undefined' &&
+      typeof latestError === 'undefined'
+    ) {
+      // need to start the request if it hasn't
       if (!CONCURRENT_PROMISES[key]) {
-        // need to trigger revalidate immediately
-        // to throw the promise
+        // trigger revalidate immediately
+        // to get the promise
         revalidate()
       }
-      throw CONCURRENT_PROMISES[key]
+
+      if (
+        CONCURRENT_PROMISES[key] &&
+        typeof CONCURRENT_PROMISES[key].then === 'function'
+      ) {
+        // if it is a promise
+        throw CONCURRENT_PROMISES[key]
+      }
+
+      // it's a value, return it directly (override)
+      latestData = CONCURRENT_PROMISES[key]
+    }
+
+    if (typeof latestData === 'undefined' && latestError) {
+      // in suspense mode, throw error if there's no content
+      throw latestError
+    }
+
+    // return the latest data / error from cache
+    // in case `key` has changed
+    return {
+      error: latestError,
+      data: latestData,
+      revalidate,
+      mutate: boundMutate,
+      isValidating: stateRef.current.isValidating
     }
   }
 
-  return {
-    error,
-    // `key` might be changed in the upcoming hook re-render,
-    // but the previous state will stay
-    // so we need to match the latest key and data
-    data: keyRef.current === key ? data : undefined,
-    revalidate: forceRevalidate, // handler
-    isValidating
-  }
+  // define returned state
+  // can be memorized since the state is a ref
+  return useMemo(() => {
+    const state = { revalidate, mutate: boundMutate } as responseInterface<
+      Data,
+      Error
+    >
+    Object.defineProperties(state, {
+      error: {
+        // `key` might be changed in the upcoming hook re-render,
+        // but the previous state will stay
+        // so we need to match the latest key and data (fallback to `initialData`)
+        get: function() {
+          stateDependencies.current.error = true
+          return keyRef.current === key ? stateRef.current.error : initialError
+        },
+        enumerable: true
+      },
+      data: {
+        get: function() {
+          stateDependencies.current.data = true
+          return keyRef.current === key ? stateRef.current.data : initialData
+        },
+        enumerable: true
+      },
+      isValidating: {
+        get: function() {
+          stateDependencies.current.isValidating = true
+          return stateRef.current.isValidating
+        },
+        enumerable: true
+      }
+    })
+
+    return state
+  }, [revalidate])
 }
 
 const SWRConfig = SWRConfigContext.Provider
